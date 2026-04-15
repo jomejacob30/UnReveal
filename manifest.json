@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Shadow DOM Unblur",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Reveals client-side data hidden by CSS overlays, redacted fonts, and pseudo-elements inside Shadow DOMs.",
   "icons": {
     "16": "icon16.png",

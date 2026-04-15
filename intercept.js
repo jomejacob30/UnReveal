@@ -1,17 +1,23 @@
 /**
  * intercept.js — MAIN world, document_start
+ * Version 2.3
  *
- * Senior approach: make text directly selectable inside the popup.
- * No floating panel. No cloning. Native browser text selection.
+ * New in v2.3:
+ *   - Yellow insert button (top-right of popup) applies the Grammarly
+ *     suggestion directly into the document — no copy/paste needed
+ *   - Get Plus + Dismiss buttons hidden from popup
+ *   - Clean text extraction: walks DOM tree, skips strikethrough
+ *     (f1t69bad / strikeoutHorizontal) elements, keeps regular +
+ *     replacement (fp3q8eq) text
+ *   - Original text extraction: used to find + replace the exact
+ *     phrase in the document via Selection API + execCommand
+ *   - Fallback: copies clean text to clipboard if direct insert fails
  *
- * Grammarly blocks selection with 3 layers:
- *   1. CSS user-select:none        → override with !important
- *   2. selectstart preventDefault  → intercept in capture phase first
- *   3. mousedown clears selection  → intercept in capture phase first
- *
- * Since we run at document_start and intercept attachShadow itself,
- * our capture-phase listeners are registered BEFORE Grammarly's —
- * stopImmediatePropagation() prevents theirs from ever firing.
+ * Text classification (from DOM analysis):
+ *   span.fc6omth              → regular text (KEEP)
+ *   strong.f1t69bad           → strikethrough/deleted (SKIP)
+ *   strong.fp3q8eq            → replacement/addition (KEEP, blue)
+ *   span.fdogkuf              → spacer (SKIP)
  */
 
 (function () {
@@ -20,6 +26,7 @@
   const PROP_KEY      = '__unblur_shadow_root__';
   const REGISTRY_KEY  = '__unblur_shadow_hosts__';
   const INJECTED_ATTR = 'data-unblur-injected';
+  const BTN_ATTR      = 'data-unblur-btn';
   const processedRoots = new WeakSet();
 
   window[REGISTRY_KEY] = window[REGISTRY_KEY] || [];
@@ -32,19 +39,22 @@
       filter: none !important;
       -webkit-filter: none !important;
     }
-    /* Make everything inside selectable */
-    .ftgla1i *, .obscuredContent *, .f1ll759f *,
-    .ftgla1i, .obscuredContent, .f1ll759f,
-    span.fc6omth, span.f18ev72d, strong.f1t69bad, strong.fp3q8eq,
+    /* Make all suggestion text selectable */
+    .ftgla1i, .ftgla1i *,
+    .obscuredContent, .obscuredContent *,
+    .f1ll759f, .f1ll759f *,
+    span.fc6omth, span.f18ev72d,
+    strong.f1t69bad, strong.fp3q8eq,
     .base_f1hmg4t3, .base_f15zcxmp, .holder_fkhz08q,
-    .visibleContent, .f2wnt2z, .visibleContent *, .f2wnt2z * {
+    .visibleContent, .visibleContent *,
+    .f2wnt2z, .f2wnt2z * {
+      filter: none !important;
+      -webkit-filter: none !important;
+      opacity: 1 !important;
       user-select: text !important;
       -webkit-user-select: text !important;
       pointer-events: auto !important;
       cursor: text !important;
-      filter: none !important;
-      -webkit-filter: none !important;
-      opacity: 1 !important;
       -webkit-text-security: none !important;
     }
     /* Hide white haze overlay */
@@ -64,10 +74,10 @@
 
   function injectCSS(root) {
     if (!root || root.querySelector?.(`style[${INJECTED_ATTR}]`)) return;
-    const style = document.createElement('style');
-    style.setAttribute(INJECTED_ATTR, 'true');
-    style.textContent = UNBLUR_CSS;
-    try { root.appendChild(style); } catch (e) {}
+    const s = document.createElement('style');
+    s.setAttribute(INJECTED_ATTR, 'true');
+    s.textContent = UNBLUR_CSS;
+    try { root.appendChild(s); } catch (e) {}
   }
 
   // ─── Direct Blur Removal ───────────────────────────────────────────────
@@ -82,7 +92,6 @@
         el.style.setProperty('user-select', 'text', 'important');
         el.style.setProperty('-webkit-user-select', 'text', 'important');
         el.style.setProperty('pointer-events', 'auto', 'important');
-        el.style.setProperty('cursor', 'text', 'important');
       }
       if (el.classList?.contains('f1a2899a')) {
         el.style.setProperty('opacity', '0', 'important');
@@ -91,34 +100,299 @@
     } catch (e) {}
   }
 
+  // ─── Text Extraction ───────────────────────────────────────────────────
+  //
+  // Walks the .ftgla1i DOM tree and classifies each element:
+  //   f1t69bad / strikeoutHorizontal_f1hzeoet → DELETED text (skip)
+  //   fp3q8eq                                 → REPLACEMENT text (keep)
+  //   fc6omth                                 → REGULAR text (keep)
+  //   fdogkuf                                 → SPACER (skip)
+
+  function walkTree(rootEl, skipDeleted, skipReplacements) {
+    let text = '';
+
+    function walk(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        text += node.textContent;
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+      const cls = node.classList;
+
+      // Strikethrough / deleted text
+      if (cls.contains('f1t69bad') || cls.contains('strikeoutHorizontal_f1hzeoet')) {
+        if (!skipDeleted) node.childNodes.forEach(walk);
+        return;
+      }
+      // Replacement / addition text (blue)
+      if (cls.contains('fp3q8eq')) {
+        if (!skipReplacements) node.childNodes.forEach(walk);
+        return;
+      }
+      // Spacer elements
+      if (cls.contains('fdogkuf')) return;
+
+      node.childNodes.forEach(walk);
+    }
+
+    walk(rootEl);
+    return text.replace(/[ \t]{2,}/g, ' ').trim();
+  }
+
+  /**
+   * Clean text: what the corrected sentence should look like.
+   * Skips strikethrough (deleted), keeps regular + replacements.
+   */
+  function extractCleanText(root) {
+    const obscured = root.querySelector('.obscuredContent, .f1ll759f');
+    if (!obscured) return '';
+    const el = obscured.querySelector('.ftgla1i') || obscured;
+    return walkTree(el, true, false);   // skip deleted, keep replacements
+  }
+
+  /**
+   * Original text: what is currently in the user's document.
+   * Keeps strikethrough (was in original), skips replacements (additions).
+   */
+  function extractOriginalText(root) {
+    const obscured = root.querySelector('.obscuredContent, .f1ll759f');
+    if (!obscured) return '';
+    const el = obscured.querySelector('.ftgla1i') || obscured;
+    return walkTree(el, false, true);   // keep deleted, skip replacements
+  }
+
+  // ─── Document Insert ───────────────────────────────────────────────────
+  //
+  // Finds originalText in the active document and replaces it with cleanText.
+  // Works for: <textarea>, <input>, contenteditable elements.
+  // Falls back to clipboard copy if replacement fails.
+
+  function replaceInTextNode(el, original, replacement) {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let fullText = '';
+    const segments = [];
+    let node;
+
+    while ((node = walker.nextNode())) {
+      segments.push({ node, start: fullText.length });
+      fullText += node.textContent;
+    }
+
+    const idx = fullText.indexOf(original);
+    if (idx === -1) return false;
+
+    const end = idx + original.length;
+    const startSeg = segments.find(s => idx >= s.start && idx < s.start + s.node.textContent.length);
+    const endSeg   = segments.find(s => end > s.start  && end <= s.start + s.node.textContent.length);
+    if (!startSeg || !endSeg) return false;
+
+    const range = document.createRange();
+    range.setStart(startSeg.node, idx - startSeg.start);
+    range.setEnd(endSeg.node, end - endSeg.start);
+
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    el.focus();
+    return document.execCommand('insertText', false, replacement);
+  }
+
+  function applyToDocument(originalText, cleanText) {
+    if (!cleanText) return false;
+
+    const active = document.activeElement;
+
+    // Textarea / input
+    if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')) {
+      const idx = active.value.indexOf(originalText);
+      if (idx !== -1) {
+        active.focus();
+        active.setSelectionRange(idx, idx + originalText.length);
+        const ok = document.execCommand('insertText', false, cleanText);
+        if (ok) return true;
+        // Manual fallback
+        active.value = active.value.slice(0, idx) + cleanText + active.value.slice(idx + originalText.length);
+        active.dispatchEvent(new Event('input', { bubbles: true }));
+        active.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }
+    }
+
+    // Contenteditable
+    const editables = document.querySelectorAll('[contenteditable="true"], [contenteditable=""]');
+    for (const el of editables) {
+      const text = el.innerText || el.textContent || '';
+      if (text.includes(originalText)) {
+        if (replaceInTextNode(el, originalText, cleanText)) return true;
+      }
+    }
+
+    return false;
+  }
+
+  function copyToClipboard(text) {
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+    } else {
+      fallbackCopy(text);
+    }
+  }
+
+  function fallbackCopy(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;opacity:0;pointer-events:none;top:0;left:0;';
+    document.documentElement.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    ta.remove();
+  }
+
+  // ─── Insert Button ─────────────────────────────────────────────────────
+
+  function injectInsertButton(root) {
+    if (!root) return;
+    if (root.querySelector(`[${BTN_ATTR}]`)) return;
+
+    // Hide Get Plus / Dismiss buttons
+    root.querySelectorAll('button').forEach(btn => {
+      const t = btn.textContent.trim();
+      if (t.includes('Plus') || t.includes('Dismiss') || t.includes('Upgrade')) {
+        btn.style.setProperty('display', 'none', 'important');
+      }
+    });
+
+    // Find a suitable card container to anchor the button
+    const card = (
+      root.querySelector('.fhdmkk6') ||
+      root.querySelector('.overlayContainer')?.closest('div[class]') ||
+      root.querySelector('.overlayContainer')?.parentElement ||
+      root.firstElementChild
+    );
+    if (!card) return;
+
+    // ── Build the yellow insert button ──
+    const btn = document.createElement('button');
+    btn.setAttribute(BTN_ATTR, 'true');
+    btn.title = 'Apply suggestion to document';
+
+    // Down-arrow SVG icon (indicates "insert below / apply")
+    btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+      viewBox="0 0 24 24" fill="none" stroke="#1a1a1a"
+      stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="8 17 12 21 16 17"/>
+      <line x1="12" y1="3" x2="12" y2="21"/>
+    </svg>`;
+
+    btn.style.cssText = `
+      all: initial !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      background: #f6b900 !important;
+      border: none !important;
+      border-radius: 8px !important;
+      width: 34px !important;
+      height: 34px !important;
+      cursor: pointer !important;
+      position: absolute !important;
+      top: 10px !important;
+      right: 10px !important;
+      z-index: 99999 !important;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.35) !important;
+      transition: transform 0.1s, background 0.15s !important;
+      pointer-events: auto !important;
+    `;
+
+    // Stop Grammarly's mousedown from dismissing the popup on button click
+    btn.addEventListener('mousedown', (e) => {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+    }, true);
+
+    btn.addEventListener('click', (e) => {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+
+      const cleanText    = extractCleanText(root);
+      const originalText = extractOriginalText(root);
+
+      if (!cleanText) return;
+
+      const applied = originalText ? applyToDocument(originalText, cleanText) : false;
+
+      if (!applied) {
+        // Fallback: copy to clipboard
+        copyToClipboard(cleanText);
+        // Visual: show clipboard icon
+        btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+          viewBox="0 0 24 24" fill="none" stroke="#1a1a1a"
+          stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>`;
+        btn.style.setProperty('background', '#4caf50', 'important');
+        setTimeout(() => {
+          btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+            viewBox="0 0 24 24" fill="none" stroke="#1a1a1a"
+            stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="8 17 12 21 16 17"/>
+            <line x1="12" y1="3" x2="12" y2="21"/>
+          </svg>`;
+          btn.style.setProperty('background', '#f6b900', 'important');
+        }, 1500);
+      } else {
+        // Visual: checkmark
+        btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+          viewBox="0 0 24 24" fill="none" stroke="#1a1a1a"
+          stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>`;
+        btn.style.setProperty('background', '#4caf50', 'important');
+        setTimeout(() => {
+          btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+            viewBox="0 0 24 24" fill="none" stroke="#1a1a1a"
+            stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="8 17 12 21 16 17"/>
+            <line x1="12" y1="3" x2="12" y2="21"/>
+          </svg>`;
+          btn.style.setProperty('background', '#f6b900', 'important');
+        }, 1500);
+      }
+    }, true);
+
+    card.style.setProperty('position', 'relative', 'important');
+    card.appendChild(btn);
+  }
+
   // ─── Grammarly Reveal ──────────────────────────────────────────────────
 
   function revealGrammarly(root) {
     if (!root) return;
     try {
+      const hasContent = !!root.querySelector('.overlayContainer, .fkf0s66');
+      if (!hasContent) return;
+
       root.querySelectorAll('.overlayContainer, .fkf0s66').forEach(container => {
         const obscured = container.querySelector('.obscuredContent, .f1ll759f');
         const visible  = container.querySelector('.visibleContent, .f2wnt2z');
         if (!obscured) return;
 
-        // Remove blur from the text container
+        // Remove blur
         const blurEl = obscured.querySelector('.ftgla1i');
         if (blurEl) {
           blurEl.style.setProperty('filter', 'none', 'important');
           blurEl.style.setProperty('user-select', 'text', 'important');
           blurEl.style.setProperty('-webkit-user-select', 'text', 'important');
           blurEl.style.setProperty('pointer-events', 'auto', 'important');
-          blurEl.style.setProperty('cursor', 'text', 'important');
-          // Apply to all children
           blurEl.querySelectorAll('*').forEach(c => {
             c.style.setProperty('user-select', 'text', 'important');
             c.style.setProperty('-webkit-user-select', 'text', 'important');
             c.style.setProperty('pointer-events', 'auto', 'important');
-            c.style.setProperty('cursor', 'text', 'important');
           });
         }
 
-        // Hide haze overlay
+        // Hide haze
         obscured.querySelectorAll('.overlay, .f1a2899a').forEach(el => {
           el.style.setProperty('opacity', '0', 'important');
           el.style.setProperty('pointer-events', 'none', 'important');
@@ -132,28 +406,22 @@
             c.style.setProperty('user-select', 'text', 'important');
             c.style.setProperty('-webkit-user-select', 'text', 'important');
             c.style.setProperty('pointer-events', 'auto', 'important');
-            c.style.setProperty('cursor', 'text', 'important');
           });
           visible.appendChild(copy);
         }
       });
-    } catch (e) {}
+
+      // Inject insert button after content is present
+      injectInsertButton(root);
+
+    } catch (e) { console.error('[Unblur]', e); }
   }
 
-  // ─── THE KEY FIX: Event Interception ──────────────────────────────────
-  //
-  // Grammarly attaches selectstart + mousedown listeners to block selection.
-  // We intercept these events in CAPTURE PHASE (which runs before Grammarly's
-  // listeners) and call stopImmediatePropagation() so Grammarly never sees them.
-  //
-  // We only do this when the event originates inside Grammarly's popup,
-  // so we don't interfere with the rest of the page.
+  // ─── Event Interception (direct text selection) ────────────────────────
 
   function isInGrammarlyPopup(target) {
-    if (!target) return false;
-    // Walk up the composed path to check for grammarly-popups host
     try {
-      const path = target.composedPath ? target.composedPath() : [];
+      const path = target?.composedPath?.() || [];
       return path.some(el =>
         el.tagName === 'GRAMMARLY-POPUPS' ||
         el.tagName === 'GRAMMARLY-MIRROR' ||
@@ -165,51 +433,26 @@
           el.classList.contains('f2wnt2z')
         ))
       );
-    } catch (e) {
-      return false;
-    }
+    } catch (e) { return false; }
   }
 
   function installDocumentInterceptors() {
-    // selectstart: Grammarly calls preventDefault() here to block selection.
-    // We stop it from reaching Grammarly's listener entirely.
-    document.addEventListener('selectstart', (e) => {
-      if (isInGrammarlyPopup(e.target)) {
-        e.stopImmediatePropagation();
-        // Do NOT call preventDefault — let browser selection proceed normally
-      }
-    }, true); // true = capture phase
-
-    // mousedown: Grammarly uses this to clear any active selection.
-    document.addEventListener('mousedown', (e) => {
-      if (isInGrammarlyPopup(e.target)) {
-        e.stopImmediatePropagation();
-        // Do NOT call preventDefault — let normal focus/click proceed
-      }
-    }, true);
-
-    // copy: ensure Ctrl+C works inside the popup
-    document.addEventListener('copy', (e) => {
-      if (isInGrammarlyPopup(e.target)) {
-        e.stopImmediatePropagation();
-      }
-    }, true);
-
-    // contextmenu: allow right-click → Copy inside popup
-    document.addEventListener('contextmenu', (e) => {
-      if (isInGrammarlyPopup(e.target)) {
-        e.stopImmediatePropagation();
-      }
-    }, true);
+    ['selectstart', 'mousedown', 'copy', 'contextmenu'].forEach(evt => {
+      document.addEventListener(evt, (e) => {
+        if (isInGrammarlyPopup(e.target)) {
+          e.stopImmediatePropagation();
+          // Never preventDefault — preserve native selection / copy
+        }
+      }, true);
+    });
   }
 
   function installShadowInterceptors(root) {
-    // Same interceptors inside the shadow root itself —
-    // catches events before they propagate to the host element
     ['selectstart', 'mousedown', 'copy', 'contextmenu'].forEach(evt => {
       root.addEventListener(evt, (e) => {
+        // Don't block events on our insert button
+        if (e.target?.hasAttribute?.(BTN_ATTR)) return;
         e.stopImmediatePropagation();
-        // Never preventDefault — we only stop Grammarly's handlers
       }, true);
     });
   }
@@ -245,7 +488,7 @@
       });
       if (changed) {
         clearTimeout(debounce);
-        debounce = setTimeout(() => revealGrammarly(root), 50);
+        debounce = setTimeout(() => revealGrammarly(root), 80);
       }
     });
 
@@ -291,9 +534,7 @@
 
   // ─── Boot ──────────────────────────────────────────────────────────────
 
-  // Install document-level interceptors immediately (before any page script)
   installDocumentInterceptors();
-
   if (document.documentElement) scanDOM();
   document.addEventListener('DOMContentLoaded', scanDOM);
   window.addEventListener('load', () => {
@@ -304,5 +545,5 @@
   });
   setInterval(scanDOM, 5000);
 
-  console.log('[Unblur] v2.2 — direct selection via capture-phase event interception');
+  console.log('[Unblur] v2.3 — insert button + clean text extraction active');
 })();
