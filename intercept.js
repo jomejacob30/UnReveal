@@ -1,48 +1,48 @@
 /**
  * intercept.js — Runs in MAIN world at document_start
  *
- * Strategy (based on DevTools analysis of Grammarly's DOM):
+ * Global strategy — works on ALL websites (Gmail, Google Docs, etc.):
  *
- * Structure inside GRAMMARLY-POPUPS shadow root:
- *   .overlayContainer.fkf0s66
- *   ├── .obscuredContent.f1ll759f   ← has the REAL text, but blurred
- *   │   ├── .ftgla1i                ← filter: blur(6px) applied here
- *   │   │   └── [suggestion text]
- *   │   └── .overlay.f1a2899a      ← white haze overlay, opacity: 0.1
- *   └── .visibleContent.f2wnt2z    ← EMPTY (Grammarly withholds for free users)
- *
- * Fix:
- *   1. Remove blur from .ftgla1i
- *   2. Hide the white overlay (.f1a2899a)
- *   3. Clone obscured content into visibleContent so it renders on top
- *   4. Watch via MutationObserver so it works every time the popup opens
+ * 1. Override attachShadow to capture future shadow roots
+ * 2. Scan the DOM at multiple points (DOMContentLoaded, load, intervals)
+ *    to catch shadow roots created before our script ran
+ * 3. Watch for ANY element gaining a blur filter — not just specific classes
+ * 4. Handle popups shown/hidden via CSS (not just DOM add/remove)
+ * 5. Apply Grammarly-specific content reveal on top of generic blur removal
  */
 
 (function () {
   'use strict';
 
-  const PROP_KEY     = '__unblur_shadow_root__';
-  const REGISTRY_KEY = '__unblur_shadow_hosts__';
+  const PROP_KEY      = '__unblur_shadow_root__';
+  const REGISTRY_KEY  = '__unblur_shadow_hosts__';
   const INJECTED_ATTR = 'data-unblur-injected';
+  const processedRoots = new WeakSet();
 
   window[REGISTRY_KEY] = window[REGISTRY_KEY] || [];
 
-  // ─── CSS Payload ────────────────────────────────────────────────────
+  // ─── CSS Payload ──────────────────────────────────────────────────────
+  // Injected into every shadow root as a first line of defence.
+  // Works for any site — targets blur by class name where known,
+  // plus a broad filter:none on the Grammarly-specific classes.
 
   const UNBLUR_CSS = `
-    .ftgla1i {
+    /* Generic: kill blur on any element that Grammarly blurs */
+    .ftgla1i,
+    .obscuredContent,
+    .f1ll759f {
       filter: none !important;
       -webkit-filter: none !important;
     }
+
+    /* Hide the white haze overlay */
     .overlay.f1a2899a,
-    .f1a2899a.fqa53j6.f1fbtb6x {
+    .f1a2899a {
       opacity: 0 !important;
-      display: none !important;
+      pointer-events: none !important;
     }
-    .obscuredContent.f1ll759f {
-      filter: none !important;
-      -webkit-filter: none !important;
-    }
+
+    /* Other known Grammarly blur targets */
     span.fc6omth,
     span.f18ev72d,
     strong.f1t69bad,
@@ -59,7 +59,9 @@
       -webkit-text-security: none !important;
       user-select: text !important;
     }
-    span.fc6omth.medium_fwla7bl.f18ev72d,
+
+    /* Restore font for redacted-font technique */
+    span.fc6omth.medium_fwla7bl,
     strong.f1t69bad.medium_fwla7bl,
     strong.fp3q8eq.medium_fwla7bl {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
@@ -67,122 +69,178 @@
     }
   `;
 
-  // ─── CSS Injection ───────────────────────────────────────────────────
+  // ─── Inject CSS ────────────────────────────────────────────────────────
 
-  function injectCSS(shadowRoot) {
-    if (!shadowRoot) return;
-    if (shadowRoot.querySelector(`style[${INJECTED_ATTR}]`)) return;
+  function injectCSS(root) {
+    if (!root) return;
+    if (root.querySelector?.(`style[${INJECTED_ATTR}]`)) return;
     const style = document.createElement('style');
     style.setAttribute(INJECTED_ATTR, 'true');
     style.textContent = UNBLUR_CSS;
-    shadowRoot.appendChild(style);
+    try { root.appendChild(style); } catch (e) {}
   }
 
-  // ─── Direct Blur Removal ─────────────────────────────────────────────
-  // CSS may lose specificity battles. Direct inline style always wins.
+  // ─── Generic Blur Removal ──────────────────────────────────────────────
+  // Directly sets inline style — always beats any CSS rule.
 
-  function removeBlurFromElement(el) {
+  function unblurElement(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return;
+    try {
+      const computed = window.getComputedStyle(el);
+      const filter = computed.filter || computed.webkitFilter || '';
 
-    const computed = window.getComputedStyle(el);
-
-    // Remove any blur filter
-    if (computed.filter && computed.filter.includes('blur')) {
-      el.style.setProperty('filter', 'none', 'important');
-      el.style.setProperty('-webkit-filter', 'none', 'important');
-    }
-
-    // Hide white haze overlays
-    if (el.classList.contains('f1a2899a') || el.classList.contains('f1fbtb6x')) {
-      el.style.setProperty('opacity', '0', 'important');
-      el.style.setProperty('display', 'none', 'important');
-    }
-  }
-
-  // ─── Content Reveal ──────────────────────────────────────────────────
-  // visibleContent is empty; obscuredContent has the real text.
-  // Clone obscuredContent's inner text into visibleContent.
-
-  function revealContent(shadowRoot) {
-    const overlayContainer = shadowRoot.querySelector('.overlayContainer.fkf0s66');
-    if (!overlayContainer) return;
-
-    const obscured = overlayContainer.querySelector('.obscuredContent.f1ll759f');
-    const visible  = overlayContainer.querySelector('.visibleContent.f2wnt2z');
-    if (!obscured || !visible) return;
-
-    // Remove blur from .ftgla1i inside obscured
-    const blurTarget = obscured.querySelector('.ftgla1i');
-    if (blurTarget) {
-      blurTarget.style.setProperty('filter', 'none', 'important');
-      blurTarget.style.setProperty('-webkit-filter', 'none', 'important');
-    }
-
-    // Hide white overlay inside obscured
-    obscured.querySelectorAll('.overlay, .f1a2899a').forEach(el => {
-      el.style.setProperty('opacity', '0', 'important');
-      el.style.setProperty('display', 'none', 'important');
-    });
-
-    // If visibleContent is empty, clone obscured content into it
-    if (!visible.hasChildNodes() && obscured.hasChildNodes()) {
-      const clone = obscured.querySelector('.ftgla1i');
-      if (clone) {
-        const copy = clone.cloneNode(true);
-        copy.style.setProperty('filter', 'none', 'important');
-        visible.appendChild(copy);
+      if (filter && filter !== 'none' && filter.includes('blur')) {
+        el.style.setProperty('filter', 'none', 'important');
+        el.style.setProperty('-webkit-filter', 'none', 'important');
       }
-    }
+
+      // Kill white haze overlays (opacity trick)
+      if (
+        (el.classList.contains('overlay') && el.classList.contains('f1a2899a')) ||
+        el.classList.contains('f1fbtb6x')
+      ) {
+        el.style.setProperty('opacity', '0', 'important');
+        el.style.setProperty('pointer-events', 'none', 'important');
+      }
+    } catch (e) {}
   }
 
-  // ─── Full Shadow Root Processing ─────────────────────────────────────
+  // ─── Grammarly Content Reveal ──────────────────────────────────────────
+  // Grammarly puts the real text in .obscuredContent but leaves
+  // .visibleContent empty for free users. We clone the text across.
 
-  function processShadowRoot(shadowRoot) {
-    if (!shadowRoot) return;
+  function revealGrammarly(root) {
+    if (!root) return;
+    try {
+      const containers = root.querySelectorAll('.overlayContainer, .fkf0s66');
+      containers.forEach(container => {
+        const obscured = container.querySelector('.obscuredContent, .f1ll759f');
+        const visible  = container.querySelector('.visibleContent, .f2wnt2z');
+        if (!obscured || !visible) return;
 
-    // 1. Inject CSS
-    injectCSS(shadowRoot);
+        // Remove blur from .ftgla1i inside obscured
+        const blurTarget = obscured.querySelector('.ftgla1i');
+        if (blurTarget) {
+          blurTarget.style.setProperty('filter', 'none', 'important');
+          blurTarget.style.setProperty('-webkit-filter', 'none', 'important');
+        }
 
-    // 2. Scan all elements and remove blur inline
-    shadowRoot.querySelectorAll('*').forEach(removeBlurFromElement);
+        // Hide overlay haze
+        obscured.querySelectorAll('.overlay, .f1a2899a').forEach(el => {
+          el.style.setProperty('opacity', '0', 'important');
+          el.style.setProperty('pointer-events', 'none', 'important');
+        });
 
-    // 3. Attempt content reveal for Grammarly popup structure
-    revealContent(shadowRoot);
+        // Clone content into empty visibleContent
+        if (!visible.hasChildNodes() && obscured.hasChildNodes()) {
+          const source = obscured.querySelector('.ftgla1i') || obscured;
+          const copy = source.cloneNode(true);
+          copy.style.setProperty('filter', 'none', 'important');
+          visible.appendChild(copy);
+        }
+      });
+    } catch (e) {}
+  }
 
-    // 4. Watch for dynamically added content inside this shadow root
+  // ─── Full Shadow Root Processing ───────────────────────────────────────
+
+  function processShadowRoot(root) {
+    if (!root || processedRoots.has(root)) return;
+    processedRoots.add(root);
+
+    injectCSS(root);
+
+    // Unblur all current elements
+    root.querySelectorAll('*').forEach(unblurElement);
+    revealGrammarly(root);
+
+    // Watch for future additions AND attribute changes (display toggling)
     const observer = new MutationObserver((mutations) => {
+      let needsReveal = false;
       for (const mutation of mutations) {
-        for (const node of mutation.addedNodes) {
-          if (node.nodeType === Node.ELEMENT_NODE) {
-            removeBlurFromElement(node);
-            node.querySelectorAll?.('*').forEach(removeBlurFromElement);
-            // Re-attempt reveal when new nodes arrive
-            revealContent(shadowRoot);
-          }
+        if (mutation.type === 'childList') {
+          mutation.addedNodes.forEach(node => {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              unblurElement(node);
+              node.querySelectorAll?.('*').forEach(unblurElement);
+              needsReveal = true;
+            }
+          });
+        }
+        if (mutation.type === 'attributes') {
+          unblurElement(mutation.target);
+          needsReveal = true;
         }
       }
+      if (needsReveal) revealGrammarly(root);
     });
 
-    observer.observe(shadowRoot, { childList: true, subtree: true });
+    observer.observe(root, {
+      childList:  true,
+      subtree:    true,
+      attributes: true,
+      attributeFilter: ['style', 'class']
+    });
   }
 
-  // ─── attachShadow Override ────────────────────────────────────────────
+  // ─── DOM Scanner ───────────────────────────────────────────────────────
+  // Walks the entire document looking for shadow hosts we may have missed.
+  // Handles both open shadow roots and ones captured by our attachShadow hook.
+
+  function scanDOM() {
+    const walker = document.createTreeWalker(
+      document.documentElement,
+      NodeFilter.SHOW_ELEMENT
+    );
+    let node = walker.nextNode();
+    while (node) {
+      const root = node.shadowRoot || node[PROP_KEY];
+      if (root) {
+        processShadowRoot(root);
+        // Also recurse inside shadow root
+        const innerWalker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+        let inner = innerWalker.nextNode();
+        while (inner) {
+          const innerRoot = inner.shadowRoot || inner[PROP_KEY];
+          if (innerRoot) processShadowRoot(innerRoot);
+          inner = innerWalker.nextNode();
+        }
+      }
+      node = walker.nextNode();
+    }
+
+    // Also check global registry from intercepted attachShadow calls
+    const registry = window[REGISTRY_KEY];
+    if (Array.isArray(registry)) {
+      registry.forEach(ref => {
+        const host = ref.deref?.();
+        if (host) {
+          const root = host.shadowRoot || host[PROP_KEY];
+          if (root) processShadowRoot(root);
+        }
+      });
+    }
+  }
+
+  // ─── attachShadow Override ─────────────────────────────────────────────
 
   const originalAttachShadow = Element.prototype.attachShadow;
 
   Element.prototype.attachShadow = function (init) {
-    const shadowRoot = originalAttachShadow.call(this, init);
+    const root = originalAttachShadow.call(this, init);
 
-    // Process immediately
-    processShadowRoot(shadowRoot);
+    // Immediately process this new shadow root
+    processShadowRoot(root);
 
-    // Store reference for content.js
-    Object.defineProperty(this, PROP_KEY, {
-      value: shadowRoot,
-      configurable: false,
-      enumerable: false,
-      writable: false
-    });
+    // Store reference
+    try {
+      Object.defineProperty(this, PROP_KEY, {
+        value: root,
+        configurable: false,
+        enumerable: false,
+        writable: false
+      });
+    } catch (e) {}
 
     window[REGISTRY_KEY].push(new WeakRef(this));
 
@@ -190,8 +248,32 @@
       new CustomEvent('__unblur_shadow_attached__', { bubbles: true })
     );
 
-    return shadowRoot;
+    return root;
   };
 
-  console.log('[Unblur] intercept.js loaded — attachShadow overridden with full unblur logic');
+  // ─── Multi-Point Scanning ──────────────────────────────────────────────
+  // Catches shadow roots created before our script, or by lazy-loading.
+
+  // Immediately (some elements may already exist at document_start)
+  if (document.documentElement) scanDOM();
+
+  // After initial parse
+  document.addEventListener('DOMContentLoaded', () => {
+    scanDOM();
+  });
+
+  // After full load (images, iframes, etc.)
+  window.addEventListener('load', () => {
+    scanDOM();
+    // Extra pass for late-loading extensions (Grammarly, etc.)
+    setTimeout(scanDOM, 500);
+    setTimeout(scanDOM, 1500);
+    setTimeout(scanDOM, 3000);
+  });
+
+  // Periodic scan to catch any missed shadow roots from dynamic content
+  // (e.g. Gmail's compose window opened mid-session)
+  setInterval(scanDOM, 5000);
+
+  console.log('[Unblur] v1.1 — global intercept active on all sites');
 })();
