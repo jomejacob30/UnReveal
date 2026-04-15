@@ -91,21 +91,53 @@
     try { root.appendChild(s); } catch (e) {}
   }
 
-  // ─── Track last focused editable BEFORE popup opens ───────────────────
-  // FIX: document.activeElement at button-click time points inside shadow
-  // DOM, not the user's editor. We capture the editable on focusin instead.
+  // ─── Track last focused editable (main doc + iframes) ───────────────────
+  // Captures the editor element across Gmail iframes, Google Docs, etc.
 
   let lastEditable = null;
 
-  document.addEventListener('focusin', (e) => {
-    const el = e.target;
+  function registerEditable(el) {
     if (!el) return;
     if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-      lastEditable = { el, type: 'input' };
+      lastEditable = { el, type: 'input', doc: el.ownerDocument };
     } else if (el.isContentEditable || el.contentEditable === 'true') {
-      lastEditable = { el, type: 'contenteditable' };
+      lastEditable = { el, type: 'contenteditable', doc: el.ownerDocument };
     }
-  }, true);
+  }
+
+  // Track in main document
+  document.addEventListener('focusin', (e) => registerEditable(e.target), true);
+
+  // Track inside iframes (Gmail compose lives in an iframe on some configurations)
+  function installIframeTracking(iframe) {
+    if (iframe._unblurTracked) return;
+    iframe._unblurTracked = true;
+    const attach = () => {
+      try {
+        const doc = iframe.contentDocument;
+        if (!doc || doc === document) return;
+        doc.addEventListener('focusin', (e) => registerEditable(e.target), true);
+        // Also check if something is already focused
+        if (doc.activeElement) registerEditable(doc.activeElement);
+      } catch (e) { /* cross-origin */ }
+    };
+    if (iframe.contentDocument?.readyState === 'complete') attach();
+    else iframe.addEventListener('load', attach);
+  }
+
+  function trackAllIframes() {
+    document.querySelectorAll('iframe').forEach(installIframeTracking);
+  }
+
+  // Observe for new iframes being added (Gmail adds compose iframes dynamically)
+  const iframeObserver = new MutationObserver(trackAllIframes);
+  document.addEventListener('DOMContentLoaded', () => {
+    trackAllIframes();
+    iframeObserver.observe(document.body || document.documentElement, {
+      childList: true, subtree: true
+    });
+  });
+  window.addEventListener('load', trackAllIframes);
 
   // ─── Text normalisation ───────────────────────────────────────────────
   // FIX: collapses NBSP, tabs, line-breaks, multi-spaces for fuzzy matching
@@ -254,13 +286,77 @@
     }
   }
 
+  // ─── Search a single document for editable elements ──────────────────
+
+  function searchDoc(doc, originalText, cleanText) {
+    if (!doc) return false;
+
+    // textarea / input
+    for (const el of doc.querySelectorAll('textarea, input[type="text"], input:not([type])')) {
+      if (el.value && replaceInInput(el, originalText, cleanText)) return true;
+    }
+
+    // contenteditable — Gmail body, Outlook, Notion, etc.
+    for (const el of doc.querySelectorAll('[contenteditable]:not([contenteditable="false"])')) {
+      const txt = norm(el.textContent || '');
+      if (txt.length > 5 && txt.includes(norm(originalText))) {
+        if (replaceInContentEditable(el, originalText, cleanText)) return true;
+      }
+    }
+
+    return false;
+  }
+
+  // ─── Search all same-origin iframes ───────────────────────────────────
+  // Covers Gmail compose window, Outlook web, etc.
+
+  function searchIframes(originalText, cleanText) {
+    for (const iframe of document.querySelectorAll('iframe')) {
+      try {
+        const doc = iframe.contentDocument;
+        if (!doc || doc === document) continue;
+        if (searchDoc(doc, originalText, cleanText)) return true;
+
+        // Nested iframes (Google Docs has .docs-texteventtarget-iframe inside)
+        for (const inner of doc.querySelectorAll('iframe')) {
+          try {
+            const innerDoc = inner.contentDocument;
+            if (innerDoc && searchDoc(innerDoc, originalText, cleanText)) return true;
+          } catch (e) {}
+        }
+      } catch (e) { /* cross-origin — skip */ }
+    }
+    return false;
+  }
+
+  // ─── Google Docs specific ──────────────────────────────────────────────
+  // Google Docs text model is canvas-based. Input goes through a transparent
+  // contenteditable div inside .docs-texteventtarget-iframe.
+
+  function tryGoogleDocs(originalText, cleanText) {
+    // Find the Google Docs input surface iframe
+    const targetIframe = document.querySelector('.docs-texteventtarget-iframe');
+    if (!targetIframe) return false;
+    try {
+      const doc = targetIframe.contentDocument;
+      if (!doc) return false;
+      const editDiv = doc.querySelector('[contenteditable="true"]') || doc.body;
+      if (!editDiv) return false;
+      editDiv.focus();
+      // Google Docs responds to execCommand on its input surface
+      return document.execCommand('insertText', false, cleanText) ||
+             replaceInContentEditable(editDiv, originalText, cleanText);
+    } catch (e) { return false; }
+  }
+
   function applyToDocument(originalText, cleanText) {
     if (!cleanText) return false;
 
-    // Strategy 1: lastEditable captured via focusin (most reliable)
+    // Strategy 1: lastEditable — captured via focusin (works for most sites)
     if (lastEditable) {
-      const { el, type } = lastEditable;
-      if (el && document.contains(el)) {
+      const { el, type, doc: elDoc } = lastEditable;
+      const container = elDoc || document;
+      if (el && container.contains(el)) {
         const ok = type === 'input'
           ? replaceInInput(el, originalText, cleanText)
           : replaceInContentEditable(el, originalText, cleanText);
@@ -268,9 +364,9 @@
       }
     }
 
-    // Strategy 2: active element right now
+    // Strategy 2: document.activeElement
     const active = document.activeElement;
-    if (active && active !== document.body) {
+    if (active && active !== document.body && active.tagName !== 'BODY') {
       if (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT') {
         if (replaceInInput(active, originalText, cleanText)) return true;
       } else if (active.isContentEditable) {
@@ -278,19 +374,14 @@
       }
     }
 
-    // Strategy 3: search every textarea / input on the page
-    for (const el of document.querySelectorAll('textarea, input[type="text"], input:not([type])')) {
-      if (el.value && replaceInInput(el, originalText, cleanText)) return true;
-    }
+    // Strategy 3: Google Docs specific
+    if (tryGoogleDocs(originalText, cleanText)) return true;
 
-    // Strategy 4: search every contenteditable that contains matching text
-    for (const el of document.querySelectorAll('[contenteditable]')) {
-      if (el.contentEditable === 'false') continue;
-      const txt = el.textContent || '';
-      if (txt.length > 5 && (txt.includes(originalText) || norm(txt).includes(norm(originalText)))) {
-        if (replaceInContentEditable(el, originalText, cleanText)) return true;
-      }
-    }
+    // Strategy 4: search main document
+    if (searchDoc(document, originalText, cleanText)) return true;
+
+    // Strategy 5: search same-origin iframes (Gmail, Outlook, etc.)
+    if (searchIframes(originalText, cleanText)) return true;
 
     return false;
   }
