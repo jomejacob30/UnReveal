@@ -257,13 +257,41 @@
   function applyToDocument(originalText, cleanText) {
     if (!cleanText) return false;
 
-    // FIX: use lastEditable (captured on focusin) not document.activeElement
-    if (!lastEditable) return false;
-    const { el, type } = lastEditable;
-    if (!el || !document.contains(el)) return false;
+    // Strategy 1: lastEditable captured via focusin (most reliable)
+    if (lastEditable) {
+      const { el, type } = lastEditable;
+      if (el && document.contains(el)) {
+        const ok = type === 'input'
+          ? replaceInInput(el, originalText, cleanText)
+          : replaceInContentEditable(el, originalText, cleanText);
+        if (ok) return true;
+      }
+    }
 
-    if (type === 'input') return replaceInInput(el, originalText, cleanText);
-    if (type === 'contenteditable') return replaceInContentEditable(el, originalText, cleanText);
+    // Strategy 2: active element right now
+    const active = document.activeElement;
+    if (active && active !== document.body) {
+      if (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT') {
+        if (replaceInInput(active, originalText, cleanText)) return true;
+      } else if (active.isContentEditable) {
+        if (replaceInContentEditable(active, originalText, cleanText)) return true;
+      }
+    }
+
+    // Strategy 3: search every textarea / input on the page
+    for (const el of document.querySelectorAll('textarea, input[type="text"], input:not([type])')) {
+      if (el.value && replaceInInput(el, originalText, cleanText)) return true;
+    }
+
+    // Strategy 4: search every contenteditable that contains matching text
+    for (const el of document.querySelectorAll('[contenteditable]')) {
+      if (el.contentEditable === 'false') continue;
+      const txt = el.textContent || '';
+      if (txt.length > 5 && (txt.includes(originalText) || norm(txt).includes(norm(originalText)))) {
+        if (replaceInContentEditable(el, originalText, cleanText)) return true;
+      }
+    }
+
     return false;
   }
 
@@ -292,11 +320,11 @@
     btn.title = 'Apply suggestion to document';
     btn.innerHTML = ICON_SVG;
     btn.style.cssText = `
-      all: initial !important;
+      all: initial;
       position: fixed !important;
       z-index: 2147483647 !important;
-      width: 42px !important;
-      height: 42px !important;
+      width: 44px !important;
+      height: 44px !important;
       padding: 0 !important;
       margin: 0 !important;
       background: none !important;
@@ -304,8 +332,8 @@
       cursor: pointer !important;
       display: none !important;
       pointer-events: auto !important;
-      border-radius: 50% !important;
       overflow: visible !important;
+      box-sizing: border-box !important;
     `;
 
     // FIX: preventDefault stops button from stealing focus from the editor
@@ -340,14 +368,40 @@
     return btn;
   }
 
-  function showBtn(root, hostEl) {
+  function getPopupRect(root) {
+    // GRAMMARLY-POPUPS host is 0x0 with overflow:visible — useless for positioning.
+    // Instead, get the bounding rect from the actual visible card INSIDE the shadow root.
+    const candidates = [
+      root.querySelector('.overlayContainer'),
+      root.querySelector('.fkf0s66'),
+      root.querySelector('[class*="holder"]'),
+      root.querySelector('[class*="base"]'),
+      root.firstElementChild,
+    ];
+    for (const el of candidates) {
+      if (!el) continue;
+      try {
+        const r = el.getBoundingClientRect();
+        if (r.width > 10 && r.height > 10) return r;
+      } catch (e) {}
+    }
+    // Last resort: host element
+    try {
+      const r = root.host?.getBoundingClientRect?.();
+      if (r && r.width > 10) return r;
+    } catch (e) {}
+    return null;
+  }
+
+  function showBtn(root) {
+    const rect = getPopupRect(root);
+    if (!rect) return;
     const btn = getBtn();
-    const rect = hostEl?.getBoundingClientRect?.();
-    if (!rect || rect.width === 0) return;
     _currentRoot = root;
-    btn.style.setProperty('top',   `${rect.top + 6}px`,                      'important');
-    btn.style.setProperty('right',  `${window.innerWidth - rect.right + 6}px`, 'important');
-    btn.style.setProperty('display', 'block', 'important');
+    // Position at top-right corner of the popup card
+    btn.style.setProperty('top',     `${rect.top + 6}px`,                       'important');
+    btn.style.setProperty('right',   `${window.innerWidth - rect.right + 6}px`,  'important');
+    btn.style.setProperty('display', 'block',                                    'important');
   }
 
   function hideBtn() {
@@ -416,8 +470,8 @@
         }
       });
 
-      // Show insert button anchored to the GRAMMARLY-POPUPS host element
-      showBtn(root, root.host);
+      // Show insert button — uses actual popup card rect, not host element
+      showBtn(root);
 
     } catch (e) { console.error('[Unblur]', e); }
   }
