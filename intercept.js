@@ -126,9 +126,122 @@
     } catch (e) {}
   }
 
+  // ─── Floating Panel ────────────────────────────────────────────────────
+  // Creates a real DOM element OUTSIDE Grammarly's shadow root so
+  // Grammarly's JS event listeners can't block text selection or copying.
+
+  let floatingPanel = null;
+  let panelTimeout  = null;
+
+  function showFloatingPanel(text, anchorEl) {
+    if (!text || !text.trim()) return;
+
+    // Remove old panel
+    if (floatingPanel) floatingPanel.remove();
+
+    const panel = document.createElement('div');
+    panel.id = '__unblur_panel__';
+    panel.style.cssText = `
+      position: fixed;
+      z-index: 2147483647;
+      background: #1e1e1e;
+      color: #f0f0f0;
+      border: 1px solid #444;
+      border-radius: 10px;
+      padding: 12px 14px;
+      max-width: 380px;
+      min-width: 200px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+      user-select: text;
+      -webkit-user-select: text;
+      cursor: text;
+    `;
+
+    // Position near the Grammarly popup
+    const rect = anchorEl ? anchorEl.getBoundingClientRect() : null;
+    if (rect) {
+      const top  = Math.max(10, rect.top - 10);
+      const left = Math.min(window.innerWidth - 400, rect.left);
+      panel.style.top  = `${top}px`;
+      panel.style.left = `${left}px`;
+    } else {
+      panel.style.top  = '80px';
+      panel.style.right = '20px';
+    }
+
+    // Header
+    const header = document.createElement('div');
+    header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
+    header.innerHTML = `
+      <span style="font-size:11px;color:#aaa;font-weight:600;letter-spacing:0.5px;">GRAMMARLY SUGGESTION</span>
+    `;
+
+    // Copy button
+    const copyBtn = document.createElement('button');
+    copyBtn.textContent = 'Copy';
+    copyBtn.style.cssText = `
+      background: #f6b900; color: #1a1a1a; border: none; border-radius: 5px;
+      padding: 3px 10px; font-size: 11px; font-weight: 700;
+      cursor: pointer; pointer-events: auto;
+    `;
+    copyBtn.addEventListener('mousedown', (e) => e.stopPropagation());
+    copyBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(text).then(() => {
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+      });
+    });
+    header.appendChild(copyBtn);
+
+    // Close button
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '✕';
+    closeBtn.style.cssText = `
+      background: none; color: #888; border: none;
+      font-size: 13px; cursor: pointer; margin-left: 6px;
+      pointer-events: auto; padding: 2px 4px;
+    `;
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      panel.remove();
+      floatingPanel = null;
+    });
+    header.appendChild(closeBtn);
+
+    // Text content — fully selectable
+    const textEl = document.createElement('div');
+    textEl.style.cssText = `
+      user-select: text; -webkit-user-select: text;
+      cursor: text; pointer-events: auto;
+      color: #f0f0f0; line-height: 1.6;
+    `;
+    textEl.textContent = text;
+
+    panel.appendChild(header);
+    panel.appendChild(textEl);
+
+    // Stop panel from closing when clicking inside it
+    panel.addEventListener('mousedown', (e) => e.stopPropagation());
+
+    document.body.appendChild(panel);
+    floatingPanel = panel;
+
+    // Auto-dismiss after 12 seconds
+    clearTimeout(panelTimeout);
+    panelTimeout = setTimeout(() => {
+      if (floatingPanel === panel) {
+        panel.remove();
+        floatingPanel = null;
+      }
+    }, 12000);
+  }
+
   // ─── Grammarly Content Reveal ──────────────────────────────────────────
-  // Grammarly puts the real text in .obscuredContent but leaves
-  // .visibleContent empty for free users. We clone the text across.
+  // Removes blur, then shows floating panel with the suggestion text.
 
   function revealGrammarly(root) {
     if (!root) return;
@@ -137,7 +250,7 @@
       containers.forEach(container => {
         const obscured = container.querySelector('.obscuredContent, .f1ll759f');
         const visible  = container.querySelector('.visibleContent, .f2wnt2z');
-        if (!obscured || !visible) return;
+        if (!obscured) return;
 
         // Remove blur from .ftgla1i inside obscured
         const blurTarget = obscured.querySelector('.ftgla1i');
@@ -153,21 +266,24 @@
         });
 
         // Clone content into empty visibleContent
-        if (!visible.hasChildNodes() && obscured.hasChildNodes()) {
+        if (visible && !visible.hasChildNodes() && obscured.hasChildNodes()) {
           const source = obscured.querySelector('.ftgla1i') || obscured;
           const copy = source.cloneNode(true);
           copy.style.setProperty('filter', 'none', 'important');
-          copy.style.setProperty('user-select', 'text', 'important');
-          copy.style.setProperty('-webkit-user-select', 'text', 'important');
-          copy.style.setProperty('pointer-events', 'auto', 'important');
-          copy.style.setProperty('cursor', 'text', 'important');
-          // Make all children selectable too
           copy.querySelectorAll('*').forEach(child => {
             child.style.setProperty('user-select', 'text', 'important');
-            child.style.setProperty('-webkit-user-select', 'text', 'important');
             child.style.setProperty('pointer-events', 'auto', 'important');
           });
           visible.appendChild(copy);
+        }
+
+        // Extract plain text and show floating panel
+        const source = obscured.querySelector('.ftgla1i') || obscured;
+        const suggestionText = source.innerText || source.textContent || '';
+        if (suggestionText.trim()) {
+          // Find the Grammarly popup host to anchor panel position
+          const host = root.host || document.querySelector('grammarly-popups');
+          showFloatingPanel(suggestionText.trim(), host);
         }
       });
     } catch (e) {}
