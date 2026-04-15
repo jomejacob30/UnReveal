@@ -1,13 +1,17 @@
 /**
  * intercept.js — MAIN world, document_start
  *
- * Expert-reviewed v2.1 — Three root causes fixed:
- *  1. TIMING: innerText was extracted before browser paint (empty string).
- *     Fix: requestAnimationFrame + offsetHeight reflow + 20ms delay.
- *  2. EVENT ISOLATION: stopPropagation alone doesn't block all Grammarly
- *     handlers. Fix: stopImmediatePropagation in capture phase on panel.
- *  3. CSS BLEED: Grammarly's styles bled into our panel.
- *     Fix: `all: revert` resets every inherited property on the panel.
+ * Senior approach: make text directly selectable inside the popup.
+ * No floating panel. No cloning. Native browser text selection.
+ *
+ * Grammarly blocks selection with 3 layers:
+ *   1. CSS user-select:none        → override with !important
+ *   2. selectstart preventDefault  → intercept in capture phase first
+ *   3. mousedown clears selection  → intercept in capture phase first
+ *
+ * Since we run at document_start and intercept attachShadow itself,
+ * our capture-phase listeners are registered BEFORE Grammarly's —
+ * stopImmediatePropagation() prevents theirs from ever firing.
  */
 
 (function () {
@@ -20,30 +24,35 @@
 
   window[REGISTRY_KEY] = window[REGISTRY_KEY] || [];
 
-  // ─── CSS Payload ───────────────────────────────────────────────────────
+  // ─── CSS ───────────────────────────────────────────────────────────────
 
   const UNBLUR_CSS = `
+    /* Strip blur */
     .ftgla1i, .obscuredContent, .f1ll759f {
       filter: none !important;
       -webkit-filter: none !important;
+    }
+    /* Make everything inside selectable */
+    .ftgla1i *, .obscuredContent *, .f1ll759f *,
+    .ftgla1i, .obscuredContent, .f1ll759f,
+    span.fc6omth, span.f18ev72d, strong.f1t69bad, strong.fp3q8eq,
+    .base_f1hmg4t3, .base_f15zcxmp, .holder_fkhz08q,
+    .visibleContent, .f2wnt2z, .visibleContent *, .f2wnt2z * {
       user-select: text !important;
       -webkit-user-select: text !important;
+      pointer-events: auto !important;
+      cursor: text !important;
+      filter: none !important;
+      -webkit-filter: none !important;
+      opacity: 1 !important;
+      -webkit-text-security: none !important;
     }
+    /* Hide white haze overlay */
     .overlay.f1a2899a, .f1a2899a {
       opacity: 0 !important;
       pointer-events: none !important;
     }
-    span.fc6omth, span.f18ev72d, strong.f1t69bad, strong.fp3q8eq,
-    .base_f1hmg4t3, .base_f15zcxmp, .holder_fkhz08q,
-    .visibleContent, .f2wnt2z {
-      filter: none !important;
-      -webkit-filter: none !important;
-      backdrop-filter: none !important;
-      opacity: 1 !important;
-      -webkit-text-security: none !important;
-      user-select: text !important;
-      -webkit-user-select: text !important;
-    }
+    /* Fix obfuscated fonts */
     span.fc6omth.medium_fwla7bl, strong.f1t69bad.medium_fwla7bl,
     strong.fp3q8eq.medium_fwla7bl {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
@@ -54,8 +63,7 @@
   // ─── CSS Injection ─────────────────────────────────────────────────────
 
   function injectCSS(root) {
-    if (!root) return;
-    if (root.querySelector?.(`style[${INJECTED_ATTR}]`)) return;
+    if (!root || root.querySelector?.(`style[${INJECTED_ATTR}]`)) return;
     const style = document.createElement('style');
     style.setAttribute(INJECTED_ATTR, 'true');
     style.textContent = UNBLUR_CSS;
@@ -68,208 +76,19 @@
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return;
     try {
       const f = window.getComputedStyle(el).filter || '';
-      if (f && f !== 'none' && f.includes('blur')) {
+      if (f !== 'none' && f.includes('blur')) {
         el.style.setProperty('filter', 'none', 'important');
         el.style.setProperty('-webkit-filter', 'none', 'important');
         el.style.setProperty('user-select', 'text', 'important');
         el.style.setProperty('-webkit-user-select', 'text', 'important');
         el.style.setProperty('pointer-events', 'auto', 'important');
+        el.style.setProperty('cursor', 'text', 'important');
       }
-      if (el.classList.contains('f1a2899a') || el.classList.contains('f1fbtb6x')) {
+      if (el.classList?.contains('f1a2899a')) {
         el.style.setProperty('opacity', '0', 'important');
         el.style.setProperty('pointer-events', 'none', 'important');
       }
     } catch (e) {}
-  }
-
-  // ─── Async Text Extraction (timing-safe) ──────────────────────────────
-  // ROOT CAUSE FIX #1: innerText returns '' if called before browser paint.
-  // requestAnimationFrame → microtask → setTimeout(20) ensures layout is done.
-
-  function extractText(obscuredEl) {
-    return new Promise((resolve) => {
-      if (!obscuredEl) return resolve('');
-      requestAnimationFrame(() => {
-        Promise.resolve().then(() => {
-          setTimeout(() => {
-            const target = obscuredEl.querySelector('.ftgla1i') || obscuredEl;
-            void target.offsetHeight; // force reflow so innerText is accurate
-            const text = (target.innerText || target.textContent || '').trim();
-            resolve(text);
-          }, 20);
-        });
-      });
-    });
-  }
-
-  // ─── Floating Panel ────────────────────────────────────────────────────
-  // ROOT CAUSE FIX #2 & #3: Panel lives in main DOM (outside shadow root),
-  // uses `all: revert` to escape Grammarly's CSS, and blocks ALL events
-  // using capture-phase stopImmediatePropagation.
-
-  let floatingPanel   = null;
-  let dismissTimer    = null;
-  let outsideListener = null;
-  let lastText        = '';
-
-  function copyToClipboard(text, btn) {
-    const succeed = () => {
-      btn.textContent = '✓ Copied!';
-      btn.style.background = '#4caf50';
-      setTimeout(() => { btn.textContent = 'Copy'; btn.style.background = '#f6b900'; }, 1500);
-    };
-    const fail = () => {
-      // execCommand fallback for restricted contexts
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.cssText = 'position:fixed;opacity:0;pointer-events:none;top:0;left:0;';
-      document.documentElement.appendChild(ta);
-      ta.select();
-      try { document.execCommand('copy'); succeed(); } catch (e) {}
-      ta.remove();
-    };
-    if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).then(succeed).catch(fail);
-    } else {
-      fail();
-    }
-  }
-
-  function removePanel() {
-    clearTimeout(dismissTimer);
-    if (outsideListener) {
-      document.removeEventListener('mousedown', outsideListener, true);
-      outsideListener = null;
-    }
-    if (floatingPanel) {
-      floatingPanel.remove();
-      floatingPanel = null;
-    }
-    lastText = '';
-  }
-
-  function blockEvent(e) {
-    e.stopPropagation();
-    e.stopImmediatePropagation();
-  }
-
-  function showPanel(text, hostEl) {
-    if (!text) return;
-    // Skip if same suggestion already showing
-    if (text === lastText && floatingPanel) return;
-    lastText = text;
-    removePanel();
-
-    const panel = document.createElement('div');
-    panel.setAttribute('data-unblur-panel', 'true');
-
-    // Position: anchor near the Grammarly popup
-    let top = 80, left = 20;
-    try {
-      const rect = hostEl?.getBoundingClientRect();
-      if (rect && rect.width > 0) {
-        top  = Math.max(10, rect.top - 140);
-        left = Math.max(10, Math.min(window.innerWidth - 420, rect.left));
-      }
-    } catch (e) {}
-
-    // ROOT CAUSE FIX #3: `all: revert` nukes every inherited Grammarly style
-    panel.style.cssText = `
-      all: revert;
-      position: fixed !important;
-      top: ${top}px !important;
-      left: ${left}px !important;
-      z-index: 2147483647 !important;
-      width: 380px !important;
-      max-width: calc(100vw - 40px) !important;
-      background: #1e1e2e !important;
-      color: #cdd6f4 !important;
-      border: 1px solid #45475a !important;
-      border-radius: 12px !important;
-      padding: 14px 16px !important;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif !important;
-      font-size: 13px !important;
-      line-height: 1.6 !important;
-      box-shadow: 0 16px 48px rgba(0,0,0,0.5) !important;
-      box-sizing: border-box !important;
-      user-select: text !important;
-      -webkit-user-select: text !important;
-      cursor: default !important;
-      word-wrap: break-word !important;
-      white-space: pre-wrap !important;
-    `;
-
-    // ROOT CAUSE FIX #2: Block ALL events in capture phase
-    ['mousedown','mouseup','click','dblclick','mousemove','touchstart','touchend','keydown']
-      .forEach(evt => panel.addEventListener(evt, blockEvent, true));
-
-    // ── Header ──
-    const header = document.createElement('div');
-    header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;user-select:none;-webkit-user-select:none;';
-
-    const label = document.createElement('span');
-    label.style.cssText = 'font-size:10px;font-weight:700;letter-spacing:1px;color:#6c7086;text-transform:uppercase;';
-    label.textContent = 'Grammarly Suggestion';
-
-    const btns = document.createElement('div');
-    btns.style.cssText = 'display:flex;gap:6px;align-items:center;';
-
-    const copyBtn = document.createElement('button');
-    copyBtn.textContent = 'Copy';
-    copyBtn.style.cssText = `
-      all:revert;background:#f6b900;color:#1a1a1a;border:none;
-      border-radius:6px;padding:4px 12px;font-size:11px;font-weight:700;
-      cursor:pointer;font-family:inherit;user-select:none;-webkit-user-select:none;
-    `;
-    copyBtn.addEventListener('mousedown', blockEvent, true);
-    copyBtn.addEventListener('click', (e) => {
-      blockEvent(e);
-      copyToClipboard(text, copyBtn);
-    }, true);
-
-    const closeBtn = document.createElement('button');
-    closeBtn.textContent = '✕';
-    closeBtn.style.cssText = `
-      all:revert;background:none;color:#6c7086;border:none;
-      font-size:14px;cursor:pointer;padding:2px 6px;border-radius:4px;
-      font-family:inherit;user-select:none;-webkit-user-select:none;
-    `;
-    closeBtn.addEventListener('mousedown', blockEvent, true);
-    closeBtn.addEventListener('click', (e) => { blockEvent(e); removePanel(); }, true);
-
-    btns.appendChild(copyBtn);
-    btns.appendChild(closeBtn);
-    header.appendChild(label);
-    header.appendChild(btns);
-
-    // ── Text (fully selectable) ──
-    const textEl = document.createElement('div');
-    textEl.style.cssText = `
-      user-select:text !important;-webkit-user-select:text !important;
-      cursor:text !important;pointer-events:auto !important;
-      color:#cdd6f4;line-height:1.6;word-wrap:break-word;white-space:pre-wrap;
-    `;
-    textEl.textContent = text;
-
-    panel.appendChild(header);
-    panel.appendChild(textEl);
-
-    // Append to documentElement (not body) — avoids body-level Grammarly listeners
-    document.documentElement.appendChild(panel);
-    floatingPanel = panel;
-
-    // Auto-dismiss after 15s
-    dismissTimer = setTimeout(removePanel, 15000);
-
-    // Click-outside dismissal — delayed so panel-creation click doesn't trigger it
-    setTimeout(() => {
-      outsideListener = (e) => {
-        if (floatingPanel && !floatingPanel.contains(e.target)) {
-          removePanel();
-        }
-      };
-      document.addEventListener('mousedown', outsideListener, true);
-    }, 200);
   }
 
   // ─── Grammarly Reveal ──────────────────────────────────────────────────
@@ -282,34 +101,117 @@
         const visible  = container.querySelector('.visibleContent, .f2wnt2z');
         if (!obscured) return;
 
-        // Strip blur immediately (visual fix)
+        // Remove blur from the text container
         const blurEl = obscured.querySelector('.ftgla1i');
         if (blurEl) {
           blurEl.style.setProperty('filter', 'none', 'important');
-          blurEl.style.setProperty('-webkit-filter', 'none', 'important');
+          blurEl.style.setProperty('user-select', 'text', 'important');
+          blurEl.style.setProperty('-webkit-user-select', 'text', 'important');
+          blurEl.style.setProperty('pointer-events', 'auto', 'important');
+          blurEl.style.setProperty('cursor', 'text', 'important');
+          // Apply to all children
+          blurEl.querySelectorAll('*').forEach(c => {
+            c.style.setProperty('user-select', 'text', 'important');
+            c.style.setProperty('-webkit-user-select', 'text', 'important');
+            c.style.setProperty('pointer-events', 'auto', 'important');
+            c.style.setProperty('cursor', 'text', 'important');
+          });
         }
+
+        // Hide haze overlay
         obscured.querySelectorAll('.overlay, .f1a2899a').forEach(el => {
           el.style.setProperty('opacity', '0', 'important');
           el.style.setProperty('pointer-events', 'none', 'important');
         });
 
-        // Clone into visibleContent
+        // Clone into empty visibleContent
         if (visible && !visible.hasChildNodes() && blurEl) {
           const copy = blurEl.cloneNode(true);
           copy.style.setProperty('filter', 'none', 'important');
           copy.querySelectorAll('*').forEach(c => {
             c.style.setProperty('user-select', 'text', 'important');
+            c.style.setProperty('-webkit-user-select', 'text', 'important');
             c.style.setProperty('pointer-events', 'auto', 'important');
+            c.style.setProperty('cursor', 'text', 'important');
           });
           visible.appendChild(copy);
         }
-
-        // Extract text AFTER paint and show panel
-        extractText(obscured).then(text => {
-          if (text) showPanel(text, root.host || document.querySelector('grammarly-popups'));
-        });
       });
     } catch (e) {}
+  }
+
+  // ─── THE KEY FIX: Event Interception ──────────────────────────────────
+  //
+  // Grammarly attaches selectstart + mousedown listeners to block selection.
+  // We intercept these events in CAPTURE PHASE (which runs before Grammarly's
+  // listeners) and call stopImmediatePropagation() so Grammarly never sees them.
+  //
+  // We only do this when the event originates inside Grammarly's popup,
+  // so we don't interfere with the rest of the page.
+
+  function isInGrammarlyPopup(target) {
+    if (!target) return false;
+    // Walk up the composed path to check for grammarly-popups host
+    try {
+      const path = target.composedPath ? target.composedPath() : [];
+      return path.some(el =>
+        el.tagName === 'GRAMMARLY-POPUPS' ||
+        el.tagName === 'GRAMMARLY-MIRROR' ||
+        (el.classList && (
+          el.classList.contains('ftgla1i') ||
+          el.classList.contains('obscuredContent') ||
+          el.classList.contains('f1ll759f') ||
+          el.classList.contains('visibleContent') ||
+          el.classList.contains('f2wnt2z')
+        ))
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function installDocumentInterceptors() {
+    // selectstart: Grammarly calls preventDefault() here to block selection.
+    // We stop it from reaching Grammarly's listener entirely.
+    document.addEventListener('selectstart', (e) => {
+      if (isInGrammarlyPopup(e.target)) {
+        e.stopImmediatePropagation();
+        // Do NOT call preventDefault — let browser selection proceed normally
+      }
+    }, true); // true = capture phase
+
+    // mousedown: Grammarly uses this to clear any active selection.
+    document.addEventListener('mousedown', (e) => {
+      if (isInGrammarlyPopup(e.target)) {
+        e.stopImmediatePropagation();
+        // Do NOT call preventDefault — let normal focus/click proceed
+      }
+    }, true);
+
+    // copy: ensure Ctrl+C works inside the popup
+    document.addEventListener('copy', (e) => {
+      if (isInGrammarlyPopup(e.target)) {
+        e.stopImmediatePropagation();
+      }
+    }, true);
+
+    // contextmenu: allow right-click → Copy inside popup
+    document.addEventListener('contextmenu', (e) => {
+      if (isInGrammarlyPopup(e.target)) {
+        e.stopImmediatePropagation();
+      }
+    }, true);
+  }
+
+  function installShadowInterceptors(root) {
+    // Same interceptors inside the shadow root itself —
+    // catches events before they propagate to the host element
+    ['selectstart', 'mousedown', 'copy', 'contextmenu'].forEach(evt => {
+      root.addEventListener(evt, (e) => {
+        e.stopImmediatePropagation();
+        // Never preventDefault — we only stop Grammarly's handlers
+      }, true);
+    });
   }
 
   // ─── Shadow Root Processing ────────────────────────────────────────────
@@ -319,30 +221,31 @@
     processedRoots.add(root);
 
     injectCSS(root);
+    installShadowInterceptors(root);
     root.querySelectorAll('*').forEach(unblurElement);
     revealGrammarly(root);
 
-    let revealDebounce = null;
+    let debounce = null;
     const observer = new MutationObserver((mutations) => {
-      let needsReveal = false;
+      let changed = false;
       mutations.forEach(m => {
         if (m.type === 'childList') {
           m.addedNodes.forEach(node => {
             if (node.nodeType === Node.ELEMENT_NODE) {
               unblurElement(node);
               node.querySelectorAll?.('*').forEach(unblurElement);
-              needsReveal = true;
+              changed = true;
             }
           });
         }
         if (m.type === 'attributes') {
           unblurElement(m.target);
-          needsReveal = true;
+          changed = true;
         }
       });
-      if (needsReveal) {
-        clearTimeout(revealDebounce);
-        revealDebounce = setTimeout(() => revealGrammarly(root), 50);
+      if (changed) {
+        clearTimeout(debounce);
+        debounce = setTimeout(() => revealGrammarly(root), 50);
       }
     });
 
@@ -362,16 +265,11 @@
       if (root) processShadowRoot(root);
       node = walker.nextNode();
     }
-    const registry = window[REGISTRY_KEY];
-    if (Array.isArray(registry)) {
-      registry.forEach(ref => {
-        const host = ref.deref?.();
-        if (host) {
-          const root = host.shadowRoot || host[PROP_KEY];
-          if (root) processShadowRoot(root);
-        }
-      });
-    }
+    (window[REGISTRY_KEY] || []).forEach(ref => {
+      const host = ref.deref?.();
+      const root = host?.shadowRoot || host?.[PROP_KEY];
+      if (root) processShadowRoot(root);
+    });
   }
 
   // ─── attachShadow Override ─────────────────────────────────────────────
@@ -391,7 +289,10 @@
     return root;
   };
 
-  // ─── Multi-point scanning ──────────────────────────────────────────────
+  // ─── Boot ──────────────────────────────────────────────────────────────
+
+  // Install document-level interceptors immediately (before any page script)
+  installDocumentInterceptors();
 
   if (document.documentElement) scanDOM();
   document.addEventListener('DOMContentLoaded', scanDOM);
@@ -403,5 +304,5 @@
   });
   setInterval(scanDOM, 5000);
 
-  console.log('[Unblur] v2.1 — timing-safe, event-isolated, CSS-reset panel active');
+  console.log('[Unblur] v2.2 — direct selection via capture-phase event interception');
 })();
