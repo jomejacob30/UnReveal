@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Shadow DOM Unblur",
+  "version": "2.0.0",
+  "description": "Reveals client-side data hidden by CSS overlays, redacted fonts, and pseudo-elements inside Shadow DOMs.",
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["intercept.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ]
+}
