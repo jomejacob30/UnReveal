@@ -33,6 +33,10 @@
     .f1ll759f {
       filter: none !important;
       -webkit-filter: none !important;
+      user-select: text !important;
+      -webkit-user-select: text !important;
+      pointer-events: auto !important;
+      cursor: text !important;
     }
 
     /* Hide the white haze overlay */
@@ -58,6 +62,19 @@
       opacity: 1 !important;
       -webkit-text-security: none !important;
       user-select: text !important;
+      -webkit-user-select: text !important;
+      pointer-events: auto !important;
+    }
+
+    /* Make the whole popup card selectable and draggable */
+    grammarly-popups,
+    grammarly-mirror,
+    .overlayContainer,
+    .fkf0s66 {
+      user-select: text !important;
+      -webkit-user-select: text !important;
+      pointer-events: auto !important;
+      cursor: text !important;
     }
 
     /* Restore font for redacted-font technique */
@@ -92,6 +109,10 @@
       if (filter && filter !== 'none' && filter.includes('blur')) {
         el.style.setProperty('filter', 'none', 'important');
         el.style.setProperty('-webkit-filter', 'none', 'important');
+        el.style.setProperty('user-select', 'text', 'important');
+        el.style.setProperty('-webkit-user-select', 'text', 'important');
+        el.style.setProperty('pointer-events', 'auto', 'important');
+        el.style.setProperty('cursor', 'text', 'important');
       }
 
       // Kill white haze overlays (opacity trick)
@@ -136,6 +157,16 @@
           const source = obscured.querySelector('.ftgla1i') || obscured;
           const copy = source.cloneNode(true);
           copy.style.setProperty('filter', 'none', 'important');
+          copy.style.setProperty('user-select', 'text', 'important');
+          copy.style.setProperty('-webkit-user-select', 'text', 'important');
+          copy.style.setProperty('pointer-events', 'auto', 'important');
+          copy.style.setProperty('cursor', 'text', 'important');
+          // Make all children selectable too
+          copy.querySelectorAll('*').forEach(child => {
+            child.style.setProperty('user-select', 'text', 'important');
+            child.style.setProperty('-webkit-user-select', 'text', 'important');
+            child.style.setProperty('pointer-events', 'auto', 'important');
+          });
           visible.appendChild(copy);
         }
       });
