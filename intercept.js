@@ -1,18 +1,23 @@
 /**
- * intercept.js — MAIN world, document_start — v2.3.1
+ * intercept.js — MAIN world, document_start — v2.4.0
  *
- * Critical fixes from audit:
- *  1. Button now lives in MAIN DOM (fixed position) — no shadow DOM injection,
- *     no fragile class-name selectors, no z-index battles
- *  2. Track lastEditable via focusin BEFORE popup opens — fixes wrong
- *     document.activeElement at button-click time
- *  3. mousedown preventDefault on button — keeps focus on editor so
- *     replacement works immediately
- *  4. Text normalization — handles NBSP, line-breaks, tabs, multi-space
- *  5. Fuzzy-match fallback — collapses whitespace on both sides before indexOf
- *  6. Range API bounds-checking — no more IndexSizeError
- *  7. Get Plus / Dismiss hidden via CSS (reliable) not JS text-search
- *  8. Correct icon SVG matching user's design (chat bubble + dark circle + plus)
+ * v2.4.0 audit fixes (Grammarly-style insert reliability):
+ *  P1. execCommand / getSelection / createRange now use el.ownerDocument —
+ *      fixes insert inside iframes (Gmail compose, Outlook web)
+ *  P2. Whitespace-collapsed fuzzy match uses correct posMap remapping —
+ *      fixes wrong text span selection on multi-space content
+ *  P3. React-safe value setter (native descriptor trick + InputEvent) —
+ *      fixes insert on React/Vue controlled inputs
+ *  P4. Captures editor selection state when popup appears (captureEditorState) —
+ *      Strategy 0 mirrors Grammarly's own stored-Range insert
+ *  P5. button:last-of-type CSS scoped to .overlayContainer/.fkf0s66 —
+ *      no longer hides buttons in non-Grammarly shadow components
+ *  P6. setInterval(scanDOM) capped at 60 s (was infinite)
+ *
+ * Retained from v2.3.x:
+ *  - Button in MAIN DOM (fixed position), mousedown preventDefault
+ *  - lastEditable via focusin, iframe tracking, Google Docs support
+ *  - Text normalization, Range bounds-checking, icon SVG
  */
 
 (function () {
@@ -76,9 +81,12 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
                    Roboto, Helvetica, Arial, sans-serif !important;
     }
-    /* FIX: Hide Get Plus / Dismiss via CSS — reliable, no text-matching needed */
-    button + button,
-    button:last-of-type {
+    /* Hide Get Plus / Dismiss — scoped to Grammarly containers only
+       (unscoped button:last-of-type would break non-Grammarly shadow UIs) */
+    .overlayContainer button + button,
+    .overlayContainer button:last-of-type,
+    .fkf0s66 button + button,
+    .fkf0s66 button:last-of-type {
       display: none !important;
     }
   `;
@@ -188,9 +196,31 @@
     return walkTree(obscured.querySelector('.ftgla1i') || obscured, false, true);
   }
 
+  // ─── React-safe value setter ────────────────────────────────────────
+  // React 16+ overrides the value property setter on inputs. Setting .value
+  // directly bypasses React's synthetic event system. The fix: call the
+  // native HTMLInputElement/HTMLTextAreaElement setter, then dispatch an
+  // InputEvent so React picks up the change.
+
+  function reactSetValue(el, newValue) {
+    const proto = el.tagName === 'TEXTAREA'
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (nativeSetter) {
+      nativeSetter.call(el, newValue);
+    } else {
+      el.value = newValue;
+    }
+    el.dispatchEvent(new InputEvent('input', {
+      bubbles: true, inputType: 'insertText', data: newValue
+    }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
   // ─── Text Replacement ─────────────────────────────────────────────────
 
   function replaceInInput(el, original, replacement) {
+    const edoc = el.ownerDocument;
     const raw = el.value;
     // Try exact, then normalised-whitespace version
     let idx = raw.indexOf(original);
@@ -210,17 +240,21 @@
     el.focus();
     el.setSelectionRange(idx, idx + len);
     // Try execCommand first (preserves undo history)
-    if (!document.execCommand('insertText', false, replacement)) {
-      el.value = raw.slice(0, idx) + replacement + raw.slice(idx + len);
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+    // FIX: use el.ownerDocument — critical when el is inside an iframe (Gmail)
+    if (!edoc.execCommand('insertText', false, replacement)) {
+      // FIX: use React-safe setter so React controlled inputs update state
+      reactSetValue(el, raw.slice(0, idx) + replacement + raw.slice(idx + len));
     }
     return true;
   }
 
   function replaceInContentEditable(el, original, replacement) {
+    // FIX: use el's own document — critical when el is inside an iframe (Gmail)
+    const edoc = el.ownerDocument;
+    const ewin = edoc.defaultView;
+
     // Walk text nodes, build full-text map with raw positions
-    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const walker = edoc.createTreeWalker(el, NodeFilter.SHOW_TEXT);
     let fullText = '';
     const segs = [];
     let node;
@@ -229,56 +263,65 @@
       fullText += node.textContent;
     }
 
-    // Try exact, then whitespace-collapsed
-    let idx = fullText.indexOf(original);
-    let matchLen = original.length;
-    if (idx === -1) {
-      const collapsed = original.replace(/\s+/g, ' ');
-      idx = fullText.replace(/\s+/g, ' ').indexOf(collapsed);
-      matchLen = collapsed.length;
-      if (idx === -1) return false;
-      // Remap: walk through fullText counting collapsed chars to find raw pos
-      let rawIdx = 0, collapsedCount = 0;
+    // Try exact match first
+    let rawStart = fullText.indexOf(original);
+    let rawEnd   = rawStart === -1 ? -1 : rawStart + original.length;
+
+    // FIX P2: Correct whitespace-collapsed fuzzy fallback using a position map
+    if (rawStart === -1) {
+      // Build collapsed text AND a map from collapsed-index → raw-index
+      const posMap = []; // posMap[i] = raw index of the i-th char in collapsed text
+      let prevWasSpace = false;
       for (let i = 0; i < fullText.length; i++) {
-        if (collapsedCount === idx) { rawIdx = i; break; }
         if (/\s/.test(fullText[i])) {
-          collapsedCount++;
-          while (i + 1 < fullText.length && /\s/.test(fullText[i + 1])) i++;
+          if (!prevWasSpace) { posMap.push(i); prevWasSpace = true; }
         } else {
-          collapsedCount++;
+          posMap.push(i);
+          prevWasSpace = false;
         }
       }
-      idx = rawIdx;
+      const cFull = fullText.replace(/\s+/g, ' '); // same length as posMap
+      const cOrig = original.replace(/\s+/g, ' ').trim();
+      const cIdx  = cFull.indexOf(cOrig);
+      if (cIdx === -1) return false;
+
+      rawStart = posMap[cIdx] ?? 0;
+      const endMapIdx = cIdx + cOrig.length - 1;
+      rawEnd = endMapIdx < posMap.length
+        ? posMap[endMapIdx] + 1
+        : fullText.length;
     }
 
-    const end = idx + matchLen;
-
-    // FIX: bounds-check before setting range
-    const startSeg = segs.find(s => idx >= s.start && idx <= s.start + s.len);
-    const endSeg   = segs.find(s => end >= s.start && end <= s.start + s.len);
+    // bounds-check before setting range
+    const startSeg = segs.find(s => rawStart >= s.start && rawStart <= s.start + s.len);
+    const endSeg   = segs.find(s => rawEnd   >= s.start && rawEnd   <= s.start + s.len);
     if (!startSeg || !endSeg) return false;
 
-    const startOff = idx - startSeg.start;
-    const endOff   = end - endSeg.start;
+    const startOff = rawStart - startSeg.start;
+    const endOff   = rawEnd   - endSeg.start;
     if (startOff < 0 || startOff > startSeg.node.textContent.length) return false;
     if (endOff   < 0 || endOff   > endSeg.node.textContent.length)   return false;
 
     try {
-      const range = document.createRange();
+      const range = edoc.createRange();
       range.setStart(startSeg.node, startOff);
       range.setEnd(endSeg.node, endOff);
-      const sel = window.getSelection();
+      // FIX: use the element's own window for getSelection
+      const sel = ewin.getSelection();
       sel.removeAllRanges();
       sel.addRange(range);
       el.focus();
-      if (!document.execCommand('insertText', false, replacement)) {
+      // FIX: use el's ownerDocument for execCommand
+      if (!edoc.execCommand('insertText', false, replacement)) {
         // Manual fallback using Range deleteContents + insertNode
         range.deleteContents();
-        range.insertNode(document.createTextNode(replacement));
-        // Collapse selection to end
+        range.insertNode(edoc.createTextNode(replacement));
         range.collapse(false);
         sel.removeAllRanges();
         sel.addRange(range);
+        el.dispatchEvent(new InputEvent('input', {
+          bubbles: true, inputType: 'insertText', data: replacement
+        }));
       }
       return true;
     } catch (e) {
@@ -338,19 +381,127 @@
     const targetIframe = document.querySelector('.docs-texteventtarget-iframe');
     if (!targetIframe) return false;
     try {
-      const doc = targetIframe.contentDocument;
-      if (!doc) return false;
-      const editDiv = doc.querySelector('[contenteditable="true"]') || doc.body;
+      const iframeDoc = targetIframe.contentDocument;
+      if (!iframeDoc) return false;
+      const editDiv = iframeDoc.querySelector('[contenteditable="true"]') || iframeDoc.body;
       if (!editDiv) return false;
       editDiv.focus();
-      // Google Docs responds to execCommand on its input surface
-      return document.execCommand('insertText', false, cleanText) ||
+      // FIX: use the iframe's document for execCommand, not the main document
+      return iframeDoc.execCommand('insertText', false, cleanText) ||
              replaceInContentEditable(editDiv, originalText, cleanText);
     } catch (e) { return false; }
   }
 
+  // ─── Capture editor state when popup appears (Grammarly-style) ──────
+  // Grammarly's Insert works because it stores the editor reference + selection
+  // Range at the moment the suggestion is generated. We capture this state when
+  // showBtn() fires — at that point the user's cursor is still in the editor.
+
+  let _savedState = null;
+
+  function captureEditorState() {
+    // Priority 1: check active element for textarea/input (recurse into iframes)
+    const tryInputIn = (doc) => {
+      if (!doc) return null;
+      try {
+        const active = doc.activeElement;
+        if (!active) return null;
+        if (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT') {
+          return {
+            type: 'input', el: active,
+            selStart: active.selectionStart, selEnd: active.selectionEnd
+          };
+        }
+        if (active.tagName === 'IFRAME') {
+          return tryInputIn(active.contentDocument);
+        }
+      } catch (e) {}
+      return null;
+    };
+
+    let state = tryInputIn(document);
+    if (state) return state;
+
+    // Priority 2: contenteditable with a non-collapsed selection (text selected)
+    const tryCEIn = (win) => {
+      try {
+        const sel = win?.getSelection?.();
+        if (!sel || sel.rangeCount === 0) return null;
+        const r = sel.getRangeAt(0);
+        const container = r.commonAncestorContainer;
+        const node = container.nodeType === Node.TEXT_NODE
+          ? container.parentElement : container;
+        const editable = node?.closest?.(
+          '[contenteditable]:not([contenteditable="false"])'
+        );
+        if (!editable) return null;
+        return { type: 'contenteditable', el: editable, range: r.cloneRange() };
+      } catch (e) { return null; }
+    };
+
+    state = tryCEIn(window);
+    if (state) return state;
+
+    for (const iframe of document.querySelectorAll('iframe')) {
+      try {
+        state = tryCEIn(iframe.contentWindow);
+        if (state) return state;
+      } catch (e) {}
+    }
+
+    return null;
+  }
+
   function applyToDocument(originalText, cleanText) {
     if (!cleanText) return false;
+
+    // Strategy 0: Grammarly-style — use editor state captured at popup-show time
+    if (_savedState) {
+      try {
+        const { type, el, selStart, selEnd, range } = _savedState;
+        if (type === 'input' && el?.isConnected) {
+          const edoc = el.ownerDocument;
+          el.focus();
+          // If text was selected and matches the original, do a targeted replace
+          const selectedLen = (selEnd ?? 0) - (selStart ?? 0);
+          if (selectedLen > 0 &&
+              norm(el.value.slice(selStart, selEnd)) === norm(originalText)) {
+            el.setSelectionRange(selStart, selEnd);
+            if (!edoc.execCommand('insertText', false, cleanText)) {
+              reactSetValue(el,
+                el.value.slice(0, selStart) + cleanText + el.value.slice(selEnd));
+            }
+            return true;
+          }
+          // Selection didn't match — fall through to text search on this element
+          if (replaceInInput(el, originalText, cleanText)) return true;
+        }
+        if (type === 'contenteditable' && range && el?.isConnected) {
+          const edoc = range.startContainer.ownerDocument;
+          const ewin = edoc.defaultView;
+          const sel = ewin.getSelection();
+          // If range has selected text matching original, do direct replacement
+          if (!range.collapsed) {
+            const rangeText = norm(range.toString());
+            if (rangeText === norm(originalText)) {
+              sel.removeAllRanges();
+              sel.addRange(range);
+              el.focus();
+              if (edoc.execCommand('insertText', false, cleanText)) return true;
+              // Manual fallback
+              range.deleteContents();
+              range.insertNode(edoc.createTextNode(cleanText));
+              range.collapse(false);
+              sel.removeAllRanges();
+              sel.addRange(range);
+              return true;
+            }
+          }
+          // Range didn't match — fall through to text search on this element
+          if (replaceInContentEditable(el, originalText, cleanText)) return true;
+        }
+      } catch (e) { /* saved state stale — fall through */ }
+    }
 
     // Strategy 1: lastEditable — captured via focusin (works for most sites)
     if (lastEditable) {
@@ -489,6 +640,8 @@
     if (!rect) return;
     const btn = getBtn();
     _currentRoot = root;
+    // FIX P4: capture editor state NOW — cursor is still in the editor
+    _savedState = captureEditorState();
     // Position at top-right corner of the popup card
     btn.style.setProperty('top',     `${rect.top + 6}px`,                       'important');
     btn.style.setProperty('right',   `${window.innerWidth - rect.right + 6}px`,  'important');
@@ -689,7 +842,12 @@
     setTimeout(scanDOM, 1500);
     setTimeout(scanDOM, 3000);
   });
-  setInterval(scanDOM, 5000);
+  // FIX P6: cap periodic scan at 60 s (12 iterations) instead of running forever
+  let _scanCount = 0;
+  const _scanInterval = setInterval(() => {
+    scanDOM();
+    if (++_scanCount >= 12) clearInterval(_scanInterval);
+  }, 5000);
 
-  console.log('[Unblur] v2.3.1 — fixed: focus tracking, range bounds, icon, main-DOM button');
+  console.log('[Unblur] v2.4.0 — Grammarly-style insert: ownerDocument fix, selection capture, React compat');
 })();
